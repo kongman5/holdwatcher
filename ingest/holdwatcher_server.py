@@ -1,128 +1,97 @@
-# ingest/holdwatcher_server.py
-# ---------------------------------------------------------------------------
-# HoldWatcher – minimal plain-WebSocket prototype (no TLS)
-# ---------------------------------------------------------------------------
-# 1️⃣  Twilio -> WebSocket -> async server (20-ms μ-law chunks)
-# 2️⃣  VAD + music-on-hold filter (Silero)
-# 3️⃣  Streaming ASR (faster-whisper) + greeting-keyword match
-# ---------------------------------------------------------------------------
+"""
+holdwatcher_server.py – detects when a real agent starts speaking
+──────────────────────────────────────────────────────────────────
+Twilio → WebSocket → async server  (16 kHz µ-law 20 ms frames)
+• Silero VAD to ignore hold music / silence
+• Gap-based buffering (flush after ≥300 ms silence)
+• faster-whisper tiny → streaming ASR
+• Keyword match → macOS “say” alert + log
+
+Run:
+    python ingest/holdwatcher_server.py 0.0.0.0 8000
+Environment:
+    TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN  (optional, not used yet)
+"""
 
 from __future__ import annotations
-import asyncio, base64, json, logging, os, sys
-from pathlib import Path
+import asyncio, base64, json, logging, os, platform, sys, time, pathlib
 
-import numpy as np
-import websockets
+import numpy as np, websockets            # pip install websockets
+from silero_vad import SileroVad          # pip install silero-vad
+from faster_whisper import WhisperModel   # pip install faster-whisper
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────── parameters ──────────────────────────────
 SAMPLE_RATE = 16_000
+SILENCE_GAP_MS = 300          # flush when this much silence is detected
 KEYWORDS = {
-    "hello": 0.8,
-    "how can i help": 0.6,
-    "thank you for calling": 0.6,
-    "this is": 0.6,
+    "hello": 0.6,
+    "how can i help": 0.5,
+    "thank you for calling": 0.5,
+    "this is": 0.5,
 }
+# ─────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(message)s",
-)
+decode_pcm = lambda b: np.frombuffer(
+    base64.b64decode(b), dtype="<i2"
+).astype(np.float32) / 32768
 
-# μ-law → float32 PCM ---------------------------------------------------------
-μLAW_TABLE = np.sign(np.arange(256) - 127) * (
-    (1 / 255) * (((1 + 255) ** (np.abs(np.arange(256) - 127) / 127)) - 1)
-)
+vad = SileroVad(sample_rate=SAMPLE_RATE)
+whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
 
-
-def mulaw_decode(mu_bytes: bytes) -> np.ndarray:
-    idx = np.frombuffer(mu_bytes, dtype=np.uint8)
-    return μLAW_TABLE[idx].astype(np.float32)
-
-
-# VAD (Silero) ----------------------------------------------------------------
-try:
-    from silero_vad import SileroVad
-
-    _vad = SileroVad(sample_rate=SAMPLE_RATE)
-    logging.info("Silero VAD loaded")
-except ImportError:
-    _vad = None
-    logging.warning("silero-vad not installed – treating all audio as speech")
-
-
-def is_speech(pcm: np.ndarray) -> bool:
-    if _vad is None:
-        return True
-    return bool((_vad(pcm, return_seconds=False) > 0.5).any())
-
-
-# Whisper ASR -----------------------------------------------------------------
-try:
-    from faster_whisper import WhisperModel
-
-    _whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
-    logging.info("Whisper model loaded")
-except ImportError:
-    _whisper = None
-    logging.warning("faster-whisper not installed – ASR disabled")
-
-
-class ASRStream:
-    """Collect 200-ms windows and emit running transcript."""
-
-    def __init__(self) -> None:
+# ────────────────────────────── ASR helper ──────────────────────────────
+class GapASR:
+    def __init__(self):
         self.buf = bytearray()
-        self.last_ms = 0
+        self.last_voiced_ms: float | None = None
 
-    async def feed(self, pcm: np.ndarray) -> str:
-        if _whisper is None:
-            return ""
-        self.buf.extend(pcm.tobytes())
-        now_ms = len(self.buf) / SAMPLE_RATE / 2 * 1000  # int16 size factor
-        if now_ms - self.last_ms < 200:
-            return ""
-        self.last_ms = now_ms
-        segments, _ = _whisper.transcribe(
-            np.frombuffer(self.buf, dtype=np.int16),
-            beam_size=1,
-            vad_filter=False,
-        )
-        return " ".join(s.text for s in segments).lower()
+    async def feed(self, pcm: np.ndarray) -> list[str]:
+        voiced = (vad(pcm, return_seconds=False) > 0.5).any()
+        now_ms = time.time() * 1000
+        out: list[str] = []
 
+        if voiced:
+            self.buf.extend((pcm * 32768).astype("<i2").tobytes())
+            self.last_voiced_ms = now_ms
+        elif self.buf and self.last_voiced_ms and now_ms - self.last_voiced_ms >= SILENCE_GAP_MS:
+            segs, _ = whisper.transcribe(
+                np.frombuffer(self.buf, dtype="<i2"), beam_size=1, vad_filter=False
+            )
+            out.append(" ".join(s.text for s in segs).lower())
+            self.buf.clear()
+            self.last_voiced_ms = None
+        return out
 
-# WebSocket handler -----------------------------------------------------------
-async def handle_call(ws: websockets.WebSocketServerProtocol):
+# ───────────────────────────── WebSocket handler ────────────────────────
+async def handler(ws):
     logging.info("Twilio stream connected")
-    asr = ASRStream()
-    async for message in ws:
-        data = json.loads(message)
-        if data.get("event") != "media":
-            continue
-        pcm = mulaw_decode(base64.b64decode(data["media"]["payload"]))
-        if not is_speech(pcm):
-            continue
-        text = await asr.feed(pcm)
-        for kw, thresh in KEYWORDS.items():
-            if kw in text:
-                logging.info(
-                    f"AGENT DETECTED – keyword '{kw}' in '{text[:80]}…'"
-                )
-                return
+    asr = GapASR()
 
+    try:
+        async for msg in ws:
+            d = json.loads(msg)
+            if d.get("event") != "media":
+                continue
+            for txt in await asr.feed(decode_pcm(d["media"]["payload"])):
+                logging.info(f"transcript: {txt}")
+                for kw, th in KEYWORDS.items():
+                    if kw in txt:
+                        logging.info(f"AGENT DETECTED – '{kw}' in '{txt[:80]}…'")
+                        if platform.system() == "Darwin":
+                            os.system('say "Agent on the line"')
+                        return
+    except websockets.exceptions.ConnectionClosedError:
+        logging.info("Stream closed")
 
-async def run_server(host: str, port: int):
-    async with websockets.serve(
-        handle_call,
-        host,
-        port,
-        max_size=2**18,  # 256 kB
-    ):
+# ─────────────────────────────── main loop ──────────────────────────────
+async def main(host: str, port: int):
+    async with websockets.serve(handler, host, port, max_size=2 ** 18):
         logging.info(f"HoldWatcher listening on ws://{host}:{port}")
-        await asyncio.Future()  # run forever
-
+        await asyncio.Future()          # run forever
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python ingest/holdwatcher_server.py <host> <port>")
         sys.exit(1)
-    asyncio.run(run_server(sys.argv[1], int(sys.argv[2])))
+    asyncio.run(main(sys.argv[1], int(sys.argv[2])))
