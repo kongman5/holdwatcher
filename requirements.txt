@@ -1,0 +1,7 @@
+websockets>=11.0
+numpy>=1.24
+silero-vad>=0.1.0
+faster-whisper>=0.10.0   # streaming ASR
+tensorflow==2.14.0        # for YAMNet music/speech model
+tensorflow-hub>=0.14
+pytest>=7.4               # test runner
